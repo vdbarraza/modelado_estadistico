@@ -1,0 +1,470 @@
+---
+title: "Trabajo Práctico"
+author: "Barraza, Veronica y Maldonado, Kevin"
+date: "Junio 2022"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+    df_print: paged
+geometry: margin=2cm
+header-includes:
+- \renewcommand\figurename{Figura}
+fontsize: 10pt
+spacing: double
+lang: es-ARG
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+if (!require("tidyverse")) install.packages("tidyverse")
+if (!require("MASS")) install.packages("MASS")
+if (!require("betareg")) install.packages("betareg")
+if (!require("effects")) install.packages("effects")
+if (!require("ggpubr")) install.packages("ggpubr")
+
+
+library(dplyr)
+library(MASS)
+library(ggplot2)
+library(purrr)
+library(betareg)
+library(nnet)
+library(effects)
+library(ggpubr)
+```
+
+### Planteo del problema
+
+En este trabajo práctico se utilizará  un conjunto de datos correspondiente a una encuesta con escala de tipo Likert (es decir, se pide al encuestado marcar un entero entre 1 y 5, donde 1 = Totalmente en desacuerdo y 5 = Totalmente
+de acuerdo). La encuesta consiste de 44 preguntas muy variadas, como ”Disfruto de bailar” o ”Creo
+que un desastre climatico podríıa llegar a ser divertido”. Para los individuos encuestados, se tienen
+también otras variables extra-encuesta que pueden ser de interés, como por ejemplo edad, géenero,
+religión, etc. El dataset contiene observaciones y 58 variables, el mismo dataset fue separado en un dataset de training y otro de testeo.
+
+Para que la separación sea adecuada, los niveles de los factores en ambos subset tienen que ser iguales. Por lo tanto, para hacer esta separación utilizamos la libreria caret.
+
+### Caso de estudio
+
+Supongamos que queremos modelar la respuesta de una de las preguntas del dataset en función de la edad y el género. En este caso: ¿Cuál sería el problema teórico de usar una regresión lineal para esto? ¿Cuál sería el problema de usar
+una regresión multinomial en este problema?
+
+Para modelar una respuesta que toma valores enteros entre 1 a 5 necesitamos un modelo que cumpla con dos condiciones: 
+
+1. que devuelva valores discretos, que podamos _mapear_ a estas cinco categorías, 
+
+2. a su vez que estos valores discretos tengan un orden que se corresponda con el orden natural de los valores de 1 a 5.
+
+La regresión lineal nos da un modelo que toma valores reales no acotados; es naturalmente ordenado pero no es claro a priori cómo convertirlos en cinco categorías discretas. Por otro lado, la regresión multinomial nos provee de estas predicciones discretas que modelan la graduación de las respuestas de la pregunta, pero estas categorías no tienen el orden natural que buscamos.
+
+```{r}
+options(warn = -1)
+pollData <- readr::read_csv("encuesta.csv") %>%
+              filter(Q37 >= 1) %>% filter(Q37 <= 5) %>% 
+              mutate(across(Q1:Q44, factor)) %>%
+              mutate(age = as.integer(age)) %>%
+              filter(age < 100) # strange ages
+            
+pollData<- pollData[ ,-1 ]      
+#print(head(pollData, n=5))
+#make this example reproducible
+set.seed(1)
+
+#use 70% of dataset as training set and 30% as test set
+sample <- sample(c(TRUE, FALSE), nrow(pollData), replace=TRUE, prob=c(0.7,0.3))
+pollTrain  <- pollData[sample, ]
+pollTest  <- pollData[!sample, ]
+```
+
+Como hay dos preguntas repetidas (27 y 43): I think a natural disaster would be kind of exciting. Chequeamos que las respuestas sean iguales,pero dado que las respuestas son diferentes las excluimos del análisis. Veamos algunas relaciones entre las variables demográficas. También analizamosos histogramas de frecuencias de las variables factores relacionadas con las preguntas (se presentan algunos en la fig. 2).
+
+```{r fig.cap=" Paiplor entre algunas de las variables del dataset", out.width="80%", fig.align="center"}
+all(pollData$Q27 == pollData$Q43)
+pollData<- pollData[,-c(27,44) ] 
+pairs(~ .,data=pollData[,49:53])
+```
+
+```{r fig.cap=" Frecuencias de algunas clases de factores", out.width="80%", fig.align="center"}
+dimension = function(df){
+kk = dim(df)[2];
+
+x = round(sqrt(kk),0);
+y = ceiling(kk/x);
+
+return(c(x,y))
+}
+par(mfrow = dimension(pollData[,1:2]))
+
+
+for(i in names(pollData[1:2])){
+  tab <- as.numeric(table(pollData[[i]]))
+  names(tab) <- names(table(pollData[[i]]))
+  p<- ggplot(data.frame(Freq = tab, fac = names(tab)), aes(fac, Freq)) + 
+    geom_point()
+   print(p) 
+}
+```
+
+
+```{r}
+# no funciona porque algunos de los factores hay pocos casos
+#library(caret)
+#pollData$country = as.factor(pollData$country)
+#pollData$age = as.numeric(pollData$age)
+#solution<-as.data.frame(table(unlist(pollData)))
+#samp = createDataPartition(solution, p = 0.80, list = F)
+
+#train = pollData[samp,]
+#test = pollData[-samp,]
+```
+
+### Regresión ordinal
+
+La regresión ordinal intenta cumplir ambos objetivos. El objetivo es: 
+si tenemos variables explicativas $x$ y una variable respuesta $y$, vamos a modelar 
+$P(y \leq i | x)$ para cada $i=1, \dots , 4$. Es fácil ver que estos valores nos permiten
+calcular $P(y=i|x)$ para cada $i=1, \dots, 5$. Basta con que estas probabilidades
+sean crecientes en $i$. Vamos a modelarlas como lineales en $x$, con un término
+independiente creciente en $i$ que nos asegura el orden de las probabilidades que
+necesitamos, y con una función de link (monótona)
+con imagen en el intervalo $(0, 1)$. Esto es, $P(y\leq i|x) = s(x^t\beta+\theta_i)$,
+con $\theta_1< \dots < \theta_4$ y $s$ función de link: por ejemplo, la función
+sigmoidea (modelo _logit_) o la función de distribución acumulada de la 
+normal estándar (modelo _probit_).
+
+Vamos a trabajar con la pregunta 37: _I have played a lot of video games_. Es natural
+pensar que podría estar correlacionar con la edad.
+
+Veamos qué distribución tienen las variables $Q37$ y $age$.
+
+```{r fig.cap=" Distribución de las variables Q37 y age", out.width="80%", fig.align="center"}
+q37Plot = ggplot(pollTrain, aes(x=Q37)) + geom_histogram(stat="count")
+agePlot = ggplot(pollTrain, aes(x=age, y=..density..)) + geom_histogram()
+
+ggarrange(q37Plot, agePlot,
+          ncol = 2, nrow = 1)
+```
+
+Intentemos ver ahora si hay alguna relación entre las variables. Grafiquemos el 
+promedio de la respuesta 37 en función de la edad.
+
+```{r echo=FALSE}
+cor(pollTrain %>%
+  group_by(age) %>%
+  summarise(meanAnswer = mean(as.numeric(levels(Q37))[Q37])))
+```
+
+```{r fig.cap=" Promedio de la respuesta 37 en función de la edad", out.width="80%", fig.align="center"}
+pollTrain %>%
+  group_by(age) %>%
+  summarise(meanAnswer = mean(as.numeric(levels(Q37))[Q37])) %>%
+  ggplot(aes(age, meanAnswer)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+```
+
+Del gráfico se desprende que, en efecto, parecen estar correlacionadas: el promedio
+de la respuesta can con la edad -que es la intuición que uno puede tener de antemano-
+y esa caída no parece estar muy lejos de ser lineal, al menos en las edades $<60$. Hacia
+el final los datos son más ruidosos (mayor dispersión), que bien puede deberse a la menor cantidad
+de encuestados en ese rango etario (ver gráfico anterior). En particular, la coeficiente de correlación entre ambas variables es aproximadamente $-0.67$, lo que indica un cierto grado de asociación lineal negativa entre las mismas.
+
+### Aplicación  del modelo de regresión ordinal para predecir Q en función de la edad.
+
+A continuación, usamos el comando **polr** del paquete **MASS** para estimar un modelo de regresión ordinal para estas variables. polr usa la interfaz de estándar en R para especificar un modelo de regresión con resultado seguido de predictores. También especificamos Hess=TRUE para que el modelo devuelva la matriz de información observada de la optimización (llamada Hessian) que se usa para obtener errores estándar.
+
+```{r}
+ordreg.q37 = MASS::polr(Q37 ~ age, data = pollTrain, Hess=TRUE)
+## view a summary of the model
+summary(ordreg.q37)
+```
+
+A continuación, vemos la tabla resumen de los coeficientes de salida de la regresión  que incluye el valor de cada coeficiente, los errores estándar y el valor t, que es simplemente la relación entre el coeficiente y su error estándar. A continuación, vemos las estimaciones de las interseptos, que a veces se denominan puntos de corte. Indican dónde se corta la variable latente para formar los  grupos que observamos en nuestros dataset:
+
+Tabla 1. Resumen de la regresión ordinal
+
+|     |   Value | Std. Error | t value |
+|-----|-------:|------------|---------|
+| age |-0.04205 | 0.002457 | -17.11  |
+
+Tabla 2. Estimaciones de las intersepto
+
+|   | Value     | Std. Error  | t value  |
+|---|-----------|-------------|----------|
+| 1 | -2.8725   | 0.0708      | -40.5826 |
+| 2 |  -2.1640  | 0.0658      | -32.9111 |
+| 3 | -1.5514   | 0.0630      | -24.6447 |
+| 4 | -0.8339   | 0.0611      | -13.6391 |
+
+```{r fig.cap=" Regresión ordinal", out.width="80%", fig.align="center"}
+plot(Effect(focal.predictors = c("age"), ordreg.q37), rug = FALSE, cex=0.01)
+```
+
+En el gráfico podemos observar como varía la probabilidad estimada de cada posible valor
+de respueta, en función de la edad. Hay un fenómeno notable: la relación de la que
+hablábamos antes es clara para los valores extremos (1 y 5), pero no parece
+ser tan fuerte para los valores intermedios. De alguna manera, el modelo está
+reconociendo que estos valores límite se comportan distinto. Hemos mencionado
+este comportamiento en clase, y se ha mencionado en la literatura también. Tal
+distribución podría ser problemático para el modelo.
+
+### Estimación de la probabilidad de que a una persona de 25 años esté al menos de acuerdo con la frase ”me gustan las armas”
+
+A continuación, veamos otro ejemplo con la pregunta Q9. Vamos a estimar la probabilidad de que a una persona de 25 años esté al menos de acuerdo con la frase ”me gustan las armas” utilkizando una regresión ordinal de la misma forma que hicimos en los parrafos anteriores. Encontramos que probabilidad de al menos de acuerdo con la frase es 0.33.
+
+```{r echo=TRUE}
+predictions.q9 = predict(MASS::polr(Q9 ~ age, data = pollTrain),
+                         newdata = data.frame(age = 25),
+                         type="probs")
+prob = predictions.q9["4"] + predictions.q9["5"]
+print(paste("Prob de al menos De acuerdo", prob))
+```
+
+### Para la pregunta Q (Q37) definir la siguiente función de pérdida
+
+La función de pérdida presenta la siguiente forma:
+
+$L(y, \hat{y}) = {\frac {1}{n}} \sum_{x_{n}=i}^n |y_{i}  {\hat{y}}|$
+
+donde $y_{i}$ es la respuesta del individuo $i$ a la pregunta Q y  $\hat{y}$ es la correspondiente predicción, notar que son números enteros entre 1 y 5.
+
+A continuación, se muestra la implementación de la función de pérdida:
+
+```{r echo=TRUE}
+l1_loss = function(y1, y2) {
+  return(sum(abs(y1-y2)) / length(y1))
+}
+```
+
+### Implementar un modelo lineal que prediga la respuesta a la pregunta Q en función de la edad.
+
+Este modelo tendrá predicciones $\hat{y}$  que pertenecen a toda la recta real. Para hacerlo comparable
+con el modelo de regresión ordinal, tomaremos como predicción final al número entero entre 1 y 5
+más cercano a $y_{i}$ 
+
+El comando básico es $lm$ (linear models). El primer argumento de este comando es una fórmula $y \sim x$ en la que se especifica cuál es la variable respuesta o dependiente (y) y cuál es la variable regresora o independiente (x). El segundo argumento, llamado data especifica cuál es el fichero en el que se encuentran las variables. El resultado lo guardamos en un objeto llamado regresion. Este objeto es una lista que contiene toda la información relevante sobre el análisis. Mediante el comando summary obtenemos un resumen de los principales resultados:
+
+En este ejemplo la ecuación de la recta de mínimos cuadrados es:
+
+$\hat{y} = 4.52-0.03*age$
+
+El coeficiente de determinación (es decir, el coeficiente de correlación al cuadrado) mide la bondad del ajuste de la recta a los datos. A partir de la salida anterior, vemos que su valor en este caso es Multiple R-squared: 0.04.
+
+```{r echo=FALSE}
+linreg.q37 = lm(Q37 ~ age,
+                data = pollTrain %>% mutate(Q37 = as.numeric(levels(Q37))[Q37]))
+
+roundToLikert = function(realNumber) {
+  rounded = round(realNumber)
+  return(min(max(rounded, 1), 5))
+}
+
+linreg.predict = function(ages, newdata) {
+  realPredictions = predict(linreg.q37, newdata=newdata)
+  likertPredictions = map(realPredictions, roundToLikert)
+  return(unlist(likertPredictions, use.names = FALSE))
+}
+
+summary(linreg.q37)
+```
+
+#### Comparación del modelo de regresión ordinal y lineal
+
+Comparar el valor de la pérdida L para el modelo de regresión ordinal y el modelo de regresión
+lineal (modificado) del item anterior, aplicando ambos. Decidir cuál de los dos es preferible. Para esto entrenamos los modelos con el set de entrenamiento y los evaluamos con el set de testeo.
+
+Como se observa en la siguiente figura, vemos que la función de pérdida es menor para la regresión lineal que para la regresión ordinal.
+
+
+```{r fig.cap=" Función de perdida: Regresión ordinal y lineal", out.width="80%", fig.align="center"}
+
+testPredictions = tibble(
+                    groundTruth = pollTest$Q37,
+                    ordinalRegression = predict(ordreg.q37, newdata=pollTest),
+                    linearRegression = linreg.predict(linreg.q37, newdata=pollTest))%>% 
+                        mutate(ordinalRegression = as.numeric(levels(ordinalRegression))[ordinalRegression],
+                         groundTruth = as.numeric(levels(groundTruth))[groundTruth]) 
+
+tibble(
+  model = c("ordinalRegression-logit",
+            "linearRegression"),
+  loss = c(l1_loss(testPredictions$groundTruth, testPredictions$ordinalRegression),
+           l1_loss(testPredictions$groundTruth, testPredictions$linearRegression)))  %>%
+  ggplot(aes(y=model, x=loss)) + geom_bar(stat = "identity")
+```
+
+#### Comparación entre múltiples modelos
+
+Ahora vamos a probar al menos 5 modelos modelos que le parezca que tengan sentido, agregando nuevas variables, interacciones, probando otros algoritmos, etc, intentando minimizar la pérdida $L$. Para la misma usamos:
+
+1. Regresión ordinal
+
+2. Regresión lineal
+
+3. Regresión ordinal con el método probit.
+
+4. Regresión múltinomial 
+
+5. Regresión ordinal con dos variables (edad y educación)
+
+```{r fig.cap=" Función de perdida", out.width="80%", fig.align="center"}
+multinonreg.model = nnet::multinom(Q37 ~ age, data=pollTrain)
+ordreg.probit.q37 = MASS::polr(Q37 ~ age, data = pollTrain, method="probit")
+ordreg.dos.q37 = MASS::polr(Q37 ~ age + education, data = pollTrain, method="probit")
+
+summary(multinonreg.model)
+
+testPredictions = tibble(
+                    groundTruth = pollTest$Q37,
+                    ordinalRegression = predict(ordreg.q37, newdata=pollTest),
+                    ordinalRegressionProbit = predict(ordreg.probit.q37, newdata=pollTest),
+                    linearRegression = linreg.predict(linreg.q37, newdata=pollTest),
+                    multinomRegression = predict(multinonreg.model, newdata=pollTest),
+                    ordinalRegressiondos=predict(ordreg.dos.q37,newdata=pollTest)) %>% 
+                  mutate(ordinalRegression = as.numeric(levels(ordinalRegression))[ordinalRegression],
+                         ordinalRegressionProbit =as.numeric(levels(ordinalRegressionProbit))[ordinalRegressionProbit],
+                         groundTruth = as.numeric(levels(groundTruth))[groundTruth],
+                         ordinalRegressiondos = as.numeric(levels(ordinalRegressiondos))[ordinalRegressiondos],
+                         multinomRegression = as.numeric(levels(multinomRegression))[multinomRegression] )
+
+tibble(
+  model = c("ordinalRegression-logit",
+            "ordinalRegression-probit",
+            "linearRegression",
+            "multinomRegression",
+            "ordinalRegression-logit two var"),
+  loss = c(l1_loss(testPredictions$groundTruth, testPredictions$ordinalRegression),
+           l1_loss(testPredictions$groundTruth, testPredictions$ordinalRegressionProbit),
+           l1_loss(testPredictions$groundTruth, testPredictions$linearRegression),
+           l1_loss(testPredictions$groundTruth, testPredictions$multinomRegression),
+           l1_loss(testPredictions$groundTruth, testPredictions$ordinalRegressiondos)
+            ))  %>%
+  ggplot(aes(y=model, x=loss)) + geom_bar(stat = "identity")
+```
+#### Regresión lógistica
+
+La Regresión Logística Simple, desarrollada por David Cox en 1958, es un método de regresión que permite estimar la probabilidad de una variable cualitativa binaria en función de una variable cuantitativa. Una de las principales aplicaciones de la regresión logística es la de clasificación binaria, en el que las observaciones se clasifican en un grupo u otro dependiendo del valor que tome la variable empleada como predictor.
+
+Consideremos ahora el problema de regresión logística que consiste en predecir si una persona
+tiene un titulo universitario o no (ver variable education, categorías 3 y 4). Para esto vamos a 
+tomar como covariables engant y age.Tomaremos como pérdida la exactitud, es
+decir, la proporción de predicciones correctas.
+
+En primer lugar, miremos cuantas instancias tenemos de cada variable con o sin título:
+
+```{r fig.cap=" Frecuencia de casos con o sin título universitario", out.width="80%", fig.align="center"}
+#library(ggplot2)
+ggplot(data =pollTrain, aes(x = education %in% c(3, 4))) + geom_bar()
+```
+
+Antes de implementar el modelo, miremos un brevemente los datos, por ejemplo gráfiquemos boxplot para la variable de interes en función de la edad:
+
+```{r fig.cap=" Box plot para la variable de interes en función de la edad ", out.width="80%", fig.align="center"}
+ggplot(data = pollTrain, aes(x = education %in% c(3, 4), y = age, color =education %in% c(3, 4))) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1) +
+  theme_bw() +
+  theme(legend.position = "null")
+```
+Ahora si, apliquemos el modelo de regresión lógistica:
+
+1. El coeficiente estimado para la intersección es el valor esperado del logaritmo de odds: -4.026.
+
+
+```{r echo=FALSE}
+education.train = pollTrain %>% mutate(hasTitle = education %in% c(3, 4))
+education.test = pollTest %>% mutate(hasTitle = education %in% c(3, 4))
+
+education.model = glm(hasTitle ~ engnat + age, 
+                      data = education.train, 
+                      family = "binomial")
+summary(education.model)
+
+```
+
+Para poder visualizar, vamos a recalcular el modelo pero solamente utilizando como variable independiente la edad:
+
+```{r fig.cap=" Regresión lógicstica en función de la edad ", out.width="80%", fig.align="center"}
+# MEDIANTE BASE GRAPHICS SIN INTERVALOS DE CONFIANZA
+
+# Codificación 0,1 de la variable respuesta
+education.train$title <- as.character(education.train$hasTitle)
+education.train$title <- as.numeric(education.train$hasTitle)
+education.model.unavar<- glm(hasTitle ~  age, 
+                      data = education.train, 
+                      family = "binomial")
+
+plot(title ~ engnat + age, education.train, col = "darkblue",
+     main = "Modelo regresión logística",
+     ylab = "P(Titulo=1|age)",
+     xlab = "age", pch = "I")
+
+# type = "response" devuelve las predicciones en forma de probabilidad en lugar de en log_ODDs
+curve(predict(education.model.unavar, data.frame( age = x), type = "response"),
+      col = "firebrick", lwd = 2.5, add = TRUE)
+```
+
+Posterior a ello, intentamos utilizar un tipo de Modelo de Selección de Variables: el de STEPWISE, el cual tiene como fin ayudar a seleccionar la mejor combinación de variables para así tener el menor AIC (se descarto esa idea porque tardaba mucho la corrida). Por lo cúal, probamos directamente incorporar todas las variables restantes observando que al menos en el dataset de training mejora la performance del modelo.
+
+```{r}
+education.train<- education.train[ ,-59 ] 
+modelo1<- glm(hasTitle ~  ., 
+                      data = education.train, 
+                      family = "binomial")
+#summary(modelo1)
+#model.AIC <- stepAIC(modelo1)
+#yhat1<-model.AIC$fitted.values
+#hist(yhat1)
+```
+
+
+### Analizar cómo varía la exactitud en función del tamaño de muestra.
+
+En esta sección vamos a estimar la exactitud utilizando del modelo de regresión lógistica presentado anteriormente el cúal utiliza como variables independientes age y engnat para distintos tamaños de dataset de entrenamiento. Se observa que a medida que aumenta el tamaño muestran incrementa la exactitud, sin embargo se llega a un limite de 0.72. Esto nos estaria indicando que para mejorar la exactitud ya no alcanza con aumentar el tamaño mostral, pero se podrían incorporar más features o variables independientes.
+
+
+```{r warning=FALSE, include=TRUE}
+trainingSizes = seq(from = 1, to = 1000, by=5)
+accuracies = rep(0, length(trainingSizes))
+tries = 10
+progressBar = txtProgressBar(min=1, max=length(trainingSizes), initial=1)
+set.seed(987)
+for (idx in 1:length(trainingSizes)) {
+  setTxtProgressBar(progressBar, idx)
+  total = 0
+  for (rep in 1:tries) {
+    education.train.shuffled = education.train[sample(1:nrow(education.train)), ]    
+    partialModel = glm(hasTitle ~ engnat + age  ,
+                        data = education.train.shuffled[1:trainingSizes[idx], ], 
+                        family = "binomial")
+    partialModel.predictions = predict(partialModel, newdata = education.test, type = "response")
+    acc = mean((partialModel.predictions > 0.5) == education.test$hasTitle)
+    total = total + acc
+  }
+  accuracies[idx] = total / tries
+}
+```
+
+Finalmente utilizamos una regresión beta para predecir cúal es el mínimo tamaño de muestra necesario para obtener una exactitud de 0.7. Se observa que no parece ser una buena aproximación (R-squared: 0.01121) para responder nuestra pregunta.
+
+
+```{r fig.cap=" Exactitud en función de n", out.width="80%", fig.align="center"}
+education.accuracies = tibble(trainingSize=trainingSizes, accuracy=accuracies)
+education.betaModel = betareg(accuracy ~ trainingSize, data=education.accuracies, link="loglog")
+
+summary(education.betaModel)
+ggplot(data=education.accuracies, aes(x=trainingSize, y=accuracy)) +
+  geom_point() +
+  geom_line(aes(
+    y=predict(education.betaModel)))
+
+
+```
+
+
+Realizamos pruebas incorporando las demás variables demográficas, pero la exactitud no aumento por encima de 0.72. Dado que al rehalizar el split en el dataset de train y test no estratificamos por las variables de factor, no se encuentran todas las clases en ambos grupos. Se intento realizar una separación teniendo en cuenta esta caracteristica, sin emabrgo encontramos númersos grupos con solamente un elemento. Esto implica que hay instancias (filas) que cuentan con una combinación de las respuestas unica. 
+
+

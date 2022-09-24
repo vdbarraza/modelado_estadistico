@@ -1,0 +1,897 @@
+---
+title: "Trabajo Práctico N° 3"
+author: "Barraza, Veronica y Maldonado, Kevin"
+date: "Julio 2022"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+    df_print: paged
+geometry: margin=2cm
+header-includes:
+- \renewcommand\figurename{Figura}
+fontsize: 10pt
+spacing: double
+lang: es-ARG
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+if (!require("tidyverse")) install.packages("tidyverse")
+if (!require("MASS")) install.packages("MASS")
+if (!require("betareg")) install.packages("betareg")
+if (!require("effects")) install.packages("effects")
+if (!require("ggpubr")) install.packages("ggpubr")
+if (!require("tm")) install.packages("tm")
+if (!require("caret")) install.packages("caret", dependencies = c("Depends", "Suggests"))
+if (!require("GGally")) install.packages("GGally")
+
+
+library(dplyr)
+library(MASS)
+library(ggplot2)
+library(purrr)
+library(betareg)
+library(nnet)
+library(effects)
+library(ggpubr)
+library(tm)
+library(mgcv)
+library(GGally)
+library(caret)
+```
+
+### Planteo del problema
+
+En este trabajo práctico se utilizará un dataset que contiene 4000 títulos de una plataforma de streaming. El archivo credits_train contiene los actores y directores para estas peíıculas y series. El objetivo de
+trabajo es  **predecir la calificación de IMDB para las películas** a partir de otras covariables para cada título.
+Consideraremos la pérdida cuadrática como forma de evaluar modelos.
+
+
+### Análisis exploratorio de datos (EDA)
+
+En esta sección vamos a realizar una exploración del dataset. 
+(a) ¿Hay algún género que parezca estar más asociado con el puntaje del título?
+(b) ¿Cómo fue evolucionando este puntaje a lo largo del tiempo?
+(c) ¿Hay algún actor o director asociado con mayores o menores puntajes?
+(d) ¿Las películas más populares son las mejor puntuadas?
+
+Antes de comenzar el análisis de EDA, tenemos que realizar una limpieza del dataset. Para esto eliminamos valores nulos, duplicados y dos columnas que presentaban un porcentaje muy alto de valores nulos.
+
+```{r include=FALSE}
+options(warn = -1)
+credit <- readr::read_csv("credits_train.csv")
+title <- readr::read_csv("titles_train.csv") 
+
+colSums(is.na(title)) # check number of missing value of each columns
+
+#eliminar duplicados
+title = title %>% group_by(imdb_id) %>% filter(row_number() == 1)
+
+# elimine las columnas con muchos null
+title <- subset(title, select = -c(seasons,age_certification )) #drop "Poster Link" & "Overview" columns
+head(title)
+colSums(is.na(title)) #chek number of missing value of each columns
+
+title <- title[-which(is.na(title$imdb_votes)),]
+
+colSums(is.na(title)) #check if there's still any missing value
+
+```
+Veamos cómo se distribuyen las películas y las series en el dataset.
+
+```{r fig.cap=" N° de observaciones con información de peliculas y series", out.width="80%", fig.align="center"}
+#(1)
+type_movie <- title %>% filter(type=='MOVIE')
+type_tv <- title %>% filter(type=='SHOW')
+ggplot() + geom_bar(title, mapping = aes(type)) #plot the different type of the movie
+```
+
+
+
+Ahora podemos visualizar cómo es la distribución de la variable de interés imdb_score.
+
+```{r fig.cap=" Distribución de IMDB_SCORE", out.width="80%", fig.align="center", fig.width=5, fig.height=3, echo=FALSE}
+title %>% ggplot(aes(x=imdb_score, y=..density..)) + geom_histogram()
+```
+
+A continuación se muestra la distribución del score en función de los distintos géneros. A nivel general se observa que la mediana se encuentra cercana a 7, con rangos dinámicos que varian entre 3 a 8. Es de notar cierta diversidad en los scores, con las películas
+de horror teniendo el puntaje más bajo, y las películas de guerra e historia el más alto.
+
+```{r fig.cap=" Boxplot: distribución del score en función de los distintos géneros", out.width="80%", fig.align="center", fig.width=5, fig.height=3}
+allGenres = c()
+allGenresScores = c()
+for (rowIdx in 1:nrow(title)) {
+  genresChr = title[[rowIdx, "genres"]]
+  rowGenders = str_match_all(genresChr, regex("[a-z]+"))[[1]][, 1]
+  if (length(rowGenders) > 0) {
+    for (genreIdx in 1:length(rowGenders)) {
+      allGenres = c(allGenres, rowGenders[genreIdx])
+      allGenresScores = c(allGenresScores, title[[rowIdx, "imdb_score"]])
+    }
+  }
+}
+tibble(genre=allGenres, score=allGenresScores) %>%
+  mutate(genre = factor(genre)) %>% 
+  ggplot(aes(y=genre, x=score)) + geom_boxplot()
+
+```
+
+Finalmente, si vemos cómo evoluciona el score a lo largo de los años, se observa una tendencia a la baja en ambos, con las series apareciendo más tardiamente y con un score
+consistentemente mayor. La tendencia a la baja podría ser un sesgo del dataset:
+quizá en IMDB se ingresan todas las películas/series nuevas, pero solo las películas/series viejas de mejor calidad. La diferencia entre los tipos podría
+manifestar una diferente población de votantes: quizá tienen criterios distintos.
+
+```{r fig.cap=" IMDB_score versus año de estreno, en función del tipo (películas o serie)", out.width="80%", fig.align="center", fig.width=5, fig.height=3}
+title %>%
+  ggplot(aes(x=release_year, y=imdb_score, colour=type)) +
+  geom_point(alpha=0.3) +
+  geom_smooth(method = "lm")
+
+```
+
+Observemos esta distribución entre tipos de manera global.
+
+```{r  fig.cap=" Distribución de IMDB_SCORE para cada tipo", out.width="80%", fig.align="center", fig.width=5, fig.height=3}
+title %>% ggplot(aes(x=type, y=imdb_score)) +
+  geom_violin() + geom_boxplot(width=0.1)
+```
+
+Se puede más explicitamente la diferencia entre las medianas de los puntajes de ambos tipos.
+
+Ahora podemos visualizar como es la distribución de la variable de interes imdb_score solamente para las observaciones relacionadas a las peliculas.
+
+```{r}
+justMovies <- title[title$type=='MOVIE',]
+```
+
+
+```{r fig.cap=" Distribución de IMDB_SCORE para las películas", out.width="80%", fig.align="center", fig.width=5, fig.height=3, echo=FALSE}
+
+ggplot(justMovies, aes(x=imdb_score)) +
+  geom_histogram()+
+  theme_bw()+
+  labs(x = "Imdb rating", y= "Count", title = "Distribution of Imdb rating by movie")
+
+```
+
+
+En la siguiente figura se observa la relación entre el score y el número de votantes.
+Es notable la relación entre ambos: pareciera ser que las películas de mayor calidad, con
+un score más alto, tienen muchos votos. Hay mucho más ruido para las películas con poca
+cantidad de votos.
+
+```{r  fig.cap="Relación entre IMDB score verus n°votantes ", out.width="80%", fig.align="center", fig.width=5, fig.height=3}
+ ggplot(justMovies, aes(x=imdb_votes, y = imdb_score))+
+  geom_point()+
+  theme_bw()+
+  geom_smooth()+
+  labs(x = "Number votes", y= "Imdb score")+ 
+  theme(axis.text.x=element_text(angle=90, hjust = 1, vjust = 0))+
+  theme(legend.position="none")
+```
+
+A continuación podemos ver las 5 películas que poseen el score más alto.
+
+```{r}
+top5_rating <- justMovies[order(justMovies$imdb_score,decreasing = T),][1:5,]
+top5_rating
+```
+
+```{r fig.cap=" Top 5 peliculas basadas según el IMDB_SCORE", out.width="80%", fig.align="center", fig.width=5, fig.height=3}
+ggplot(top5_rating, aes(x = imdb_score,y = reorder(title, imdb_score))) +
+  geom_col(aes(fill =imdb_score), show.legend = F) +
+  labs(title = "Top 5 Movies based on IMDB Rating",
+       x = "IMDB Rating",
+       y = NULL) +
+  geom_label(aes(label = imdb_score), hjust = 1.05) +
+  scale_fill_gradient(low = "red", high = "black") +
+  theme_minimal()
+```
+
+Antes de analizar la relación entre el género de las películas y el score, vamos a visualizar la frecuencia de los géneros para este dataset. Los géneros más frecuentes son : drama, comedia, acción, romance y thriller. En el próximo gráfico, podemos ver los box-plot de los scores para los géneros más frecuentes. En general no pareciera haber una gran diferencia de score entre estos géneros más votados. Los géneros de documentales y crimen presentan una mediana mayor al resto y con un menor rango dinámico.
+
+```{r fig.cap=" Frecuencia de peliculas con los diez generos más relevantes", out.width="80%", fig.align="center", fig.width=5, fig.height=3}
+
+# TODO: Replace Genre with a collection of binary columns
+genreCorpus = VCorpus(VectorSource(justMovies$genres))
+genreCorpus = tm_map(genreCorpus, content_transformer(tolower))
+genreCorpus = tm_map(genreCorpus, removeWords, c("N/A"))
+genreCorpus = tm_map(genreCorpus, removePunctuation)
+genreDocumentTermMatrix = DocumentTermMatrix(genreCorpus)
+genreMatrix = as.data.frame(as.matrix(genreDocumentTermMatrix))
+title = merge(genreMatrix, title, by=0, all=TRUE)
+
+justMovies <- title[title$type=='MOVIE',]
+
+# TODO: Select movies from top 10 most common genres and plot their relative proportions
+genreFrequencies = colSums(as.matrix(genreDocumentTermMatrix))
+genreFrequenciesOrdered = genreFrequencies[order(genreFrequencies,decreasing = TRUE)]
+topGenres = genreFrequenciesOrdered[1:10]
+topGenresName = names(topGenres)
+genresDataFrame = data.frame(names(genreFrequenciesOrdered),
+                             genreFrequenciesOrdered/sum(genreFrequencies))
+names(genresDataFrame) = c("Genre","Frequency")
+chart <- ggplot(genresDataFrame) +
+            geom_bar(aes(x = Genre, y = Frequency), stat = "identity") + theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) + ggtitle(" Movies Genre frequency")
+print(chart)
+```
+`boxplot(Action$rating, Animation$rating, Comedy$rating, Drama$rating, Documentary$rating, Romance$rating, Short$rating, names = c("Action", "Animation", "Comedy", "Drama", "Documentary", "Romance", "Short"), main = "Ratings by Genre", ylab = "Rating")
+
+
+
+```{r fig.cap=" Boxplot de IMDB_SCORE en función de los generos más relevantes", out.width="80%", fig.align="center", fig.width=5, fig.height=3}
+boxplot(justMovies$imdb_score[justMovies$action==1],
+        justMovies$imdb_score[justMovies$animation==1],
+        justMovies$imdb_score[justMovies$comedy==1],
+        justMovies$imdb_score[justMovies$drama==1],
+        justMovies$imdb_score[justMovies$documentation==1],
+        justMovies$imdb_score[justMovies$romance==1],
+        justMovies$imdb_score[justMovies$crime==1],
+        names = c("Action", "Animation", "Comedy", "Drama", "Documentary", "Romance", "Crime"),
+        main = "Ratings by Genre",
+        ylab = "Rating",
+        las = 2)
+
+```
+
+En la siguiente gráfica podemos observar el score promedio para los países que produjeron las películas con mayor score.
+
+```{r fig.cap=" Promedio de IMDB_SCORE en función de los países", out.width="80%", fig.align="center", fig.width=5, fig.height=3}
+allCountries = c()
+allCountriesScores = c()
+releaseYears = c()
+for (rowIdx in 1:nrow(title)) {
+  countriesChr = title[[rowIdx, "production_countries"]]
+  rowCountries = str_match_all(countriesChr, regex("[A-Z]+"))[[1]][, 1]
+  if (length(rowCountries) > 0) {
+    for (countryIdx in 1:length(rowCountries)) {
+      allCountries = c(allCountries, rowCountries[countryIdx])
+      allCountriesScores = c(allCountriesScores, title[[rowIdx, "imdb_score"]])
+      releaseYears = c(releaseYears, title[[rowIdx, "release_year"]])
+      
+    }
+  }
+}
+
+countriesScoresDf = tibble(country=allCountries,
+                           score=allCountriesScores,
+                           releaseYear=releaseYears)
+countriesMeanScore = countriesScoresDf %>%
+                      group_by(country) %>%
+                      summarise(meanScore = mean(score))
+topCountries = (countriesMeanScore %>%
+                  arrange(desc(meanScore)))[["country"]][1:10]
+countriesMeanScore %>% 
+  filter(country %in% topCountries) %>% 
+  mutate(country = factor(country)) %>%
+  ggplot(aes(x=reorder(country, meanScore), y=meanScore)) +
+    geom_col() +
+    xlab("country") +
+    ylab("mean score")
+```
+
+Finalmente, en esta última figura podemos ver la distribución de los score en función de los actores/directores de las misma. De la misma es posible observar que los actores/directores varian en función del rango dinámico, pero en general la mediana se encuentra cercana a 8.
+
+```{r fig.cap=" Boxplot de IMDB_SCORE de actores/directores", out.width="80%", fig.align="center", fig.width=5, fig.height=3}
+movie <- merge(title, credit, by = 'id')
+lead_actor_table = movie %>% group_by(name) %>% 
+  summarise(mean_imdb = mean(imdb_score, na.rm=T), 
+            total_movies = n(), 
+            standard_dev = sd(imdb_score), 
+            lower_bound = mean_imdb- 2* standard_dev/sqrt(total_movies), 
+            upper_bound = mean_imdb+ 2* standard_dev/sqrt(total_movies) ) %>% 
+  arrange(desc(mean_imdb))
+
+
+lead_actor_table = subset(lead_actor_table, lead_actor_table$name != "")
+
+actor_mean_movies = mean(lead_actor_table$total_movies)
+
+lead_actor_table = lead_actor_table %>% filter(total_movies >= 3)
+
+top_30_actors = lead_actor_table %>% slice(1:30)
+
+top_30_actors$actor_1_name = factor(top_30_actors$name, levels = top_30_actors$actor_1_name[order(top_30_actors$mean_imdb)])
+
+ggplot(top_30_actors, aes(x = mean_imdb, xmin = lower_bound, xmax = upper_bound, y = name)) +
+  geom_point() + 
+  geom_segment( aes(x = lower_bound, xend = upper_bound, y = name, yend=name)) + 
+  theme(axis.text=element_text(size=8)) + 
+  xlab("Mean Movie Rating") + ylab("Lead Actor") + 
+  ggtitle("Best Actors/directos by IMDB Movie Rating") + theme_bw()
+```
+### Modelos lineales mixtos
+
+Los modelos lineales mixtos fueron propuestos por (Laird and Ware 1982) y en ellos se asume que existe una relación entre el vector de observaciones  $Y_i$ del sujeto o grupo  $i$ y las covariables.
+
+La forma general de un modelo lineal mixto es:
+
+$Y = Xb + Zu + e$
+
+donde: $Y$ es el vector de respuesta (datos), $X$ y $Z$ son matrices de diseño conocidas, b es un vector de parámetros fijos, u (efectos aleatorios) y e (error) son vectores aleatorios no observables, con esperanza nula.
+
+2) A continucación vamos a implementar estos modelos en el marco del objetivo de este trabajo práctico: estimar el IMDB score de las peliculas.
+
+a) Plantear un modelo de efectos fijos para predecir el puntaje de IMDB únicamente en función
+del país de origen.
+
+- Modelo lineal sin intercept con un efecto fijo por país
+
+
+```{r , include=FALSE}
+# Modelo lineal sin intercept con un efecto fijo por país
+fit_1 = lm(score ~ country - 1, data = countriesScoresDf)
+
+fit_1 %>% summary()
+```
+
+b) Plantear un modelo de efectos aleatorios para predecir el puntaje de IMDB únicamente en
+función del país de origen
+
+-  Modelo mixto con intercept fijo y un efecto aleatorio por país
+```{r}
+library(lme4)
+# Modelo mixto con intercept fijo + un efecto aleatorio por county
+fit_2 = lmer(score ~ (1 | country), data = countriesScoresDf)
+fit_2 %>% summary()
+```
+
+c) Mostrar las estimaciones de los efectos de ambos modelos en un mismo gráfico e interpretar
+cómo se diferencian.
+
+```{r fig.cap=" Comparación entre los valores observados y estimados de cada modelo", out.width="80%"}
+library(cowplot)
+
+scoresComparison = tibble(countriesScoresDf)
+scoresComparison$fit1Prediction = predict(fit_1, newdata=countriesScoresDf)
+scoresComparison$fit2Prediction = predict(fit_2, newdata=countriesScoresDf)
+
+fit_1_plot<- ggplot(scoresComparison, aes(x=score, y=fit1Prediction)) +
+  geom_point() +
+  geom_abline(intercept=0, slope=1) +
+  labs(x='Actual Values', y='Predicted Values', title='Fixed model')
+
+fit_2_plot<- ggplot(scoresComparison, aes(x=score, y=fit2Prediction)) +
+  geom_point() +
+  geom_abline(intercept=0, slope=1) +
+  labs(x='Actual Values', y='Predicted Values', title='Random model')
+plot_grid(fit_1_plot, fit_2_plot, labels = "AUTO")
+```
+
+Veamos ahora cómo se comportan los distintos modelos en función de la cantidad de datos
+que tenemos para cada país. En este gráfico tenemos un punto para cada país, ubicado
+de acuerdo a la cantidad de datos y la predicción de score de cada modelo. Marcamos con una línea punteada la tendencia central (intercept) que nos da el modelo de efectos aleatorios.
+
+```{r fig.cap=" Comparación entre los valores observados y estimados de cada modelo, en función de la cantidad de datos", out.width="80%"}
+scoreByCount = tibble(countriesScoresDf) %>%
+                  group_by(country) %>%
+                  summarise(meanScore=mean(score), count=n())
+scoreByCount$fixedEffectPrediction = predict(fit_1, newdata=scoreByCount)
+scoreByCount$randomEffectPrediction = predict(fit_2, newdata=scoreByCount)
+
+randomEffectIntercept = fixef(fit_2)[["(Intercept)"]]
+scoreByCount %>%
+  pivot_longer(c( fixedEffectPrediction, randomEffectPrediction),
+               names_to="predictionType",
+               values_to = "value") %>% 
+  ggplot(aes(x=count, y=value, colour=predictionType)) +
+    geom_point(alpha=1/2) + 
+    geom_hline(yintercept=randomEffectIntercept,
+               linetype="dashed") + 
+    ggplot2::annotate(geom="text", x=800, y=randomEffectIntercept+.2, label="Random effects intercept", size=3) + 
+    xlab("Cantidad de datos") + ylab("Predicción")
+
+```
+Es de observar que el modelo de efectos aleatorios tiende a evaluar a los países
+más cerca de este punto medio dado por el intercept, y la diferencia es más notable
+para los países con menor cantidad de datos.
+
+3)
+
+a) Usando el modelo de efectos aleatorios del item anterior, decidir, usando la función anova,
+si agregar´ıa la variable release year.
+
+
+```{r}
+# Modelo mixto con intercept y pendiente de floor fijas + intercepts y pendientes de floor aleatorios por county
+fit_3 = lmer(score ~ releaseYear + (releaseYear | country), data = countriesScoresDf)
+fit_3 %>% summary()
+
+# anova para todos los modelos mixtos
+anova(fit_2, fit_3, test="Chi")
+
+```
+
+De los resultados observamos que al incorporar en el modelo la variable release year el BIC disminuyó y además resultó estadisticamente significativo, lo que implica que al incorporar dicha variable se redujo la varianza del modelo.
+
+
+(b) Usando el modelo de efectos aleatorios del item anterior, decidir si agregaría la variable
+release_year separando la data en dos: entrenamiento y testeo (estimar los coeficientes
+usando la data de entrenamiento y evualuarlo usando la de testeo).
+
+A partir de ahora vamos a separar nuestro dataset en dos: uno de training o entrenamiento para ajustar el modelo y otro de testeo, para evaluar la performance del mismo.
+
+
+
+```{r}
+#make this example reproducible
+set.seed(1)
+
+#use 70% of dataset as training set and 30% as test set
+scoresSample <- sample(c(TRUE, FALSE), nrow(countriesScoresDf), replace=TRUE, prob=c(0.7,0.3))
+scores.train  <- countriesScoresDf[scoresSample, ]
+scores.test  <- countriesScoresDf[!scoresSample, ]
+
+
+```
+
+En la siguiente tabla se muestra el RMSE de los dos modelos con y sin release_year. Del mismo se observa que se obtuvo un menor RMSE al incorporar el año, y cuando gráficamos la relación 1:1 entre las observaciones y predicciones también podemos ver que el modelo que no incluye el año presenta predicciones de valores constantes para varios valores del score observado. 
+
+```{r tab.cap=" Comparación del RMSE", out.width="80%"}
+fit.withoutYear = lmer(score ~ (1 | country), data = scores.train)
+fit.withYear =  lmer(score ~ releaseYear + (releaseYear | country), data = scores.train)
+
+scores.test$withoutYearPrediction = predict(fit.withoutYear, newdata=scores.test, allow.new.levels=T)
+scores.test$withYearPrediction = predict(fit.withYear, newdata = scores.test, allow.new.levels=T)
+
+
+fit.comparison = data.frame('modelo'='Sin release_year','RMSE'=sqrt(mean((scores.test$score - scores.test$withoutYearPrediction)^2)))
+
+fit.comparison <- rbind(fit.comparison, data.frame('modelo'='Con release_year','RMSE'=sqrt(mean((scores.test$score - scores.test$withYearPrediction)^2))))
+
+fit.comparison
+```
+
+```{r fig.cap=" Comparación entre los valores observados y estimados de cada modelo", out.width="80%"}
+# TODO: creo que esto se puede sacar
+
+fit_2_plot<- ggplot(scores.test, aes(x=withoutYearPrediction, y=score)) +
+  geom_point() +
+  geom_abline(intercept=0, slope=1) +
+  labs(x='Predicted Values', y='Actual Values', title='WithoutYearPrediction')
+
+fit_3_plot<- ggplot(scores.test, aes(x=withYearPrediction, y= score)) +
+  geom_point() +
+  geom_abline(intercept=0, slope=1) +
+  labs(x='Predicted Values', y='Actual Values', title='With Year Prediction')
+
+plot_grid(fit_2_plot, fit_3_plot, labels = "AUTO")
+```
+
+
+(c) Comparar ambos items anteriores.
+
+Si bien en este caso se llega a la misma conclusión, siempre es conveniente evaluar los modelos utilizando un dataset independiente. De esta forma podremos analizar si el modelo puede generalizar correctamente y estimar la variable de interés usando muestras que no las ha analizado para estimar los parámetros de los modelos.
+
+
+####  Modelos aditivos generalizados (GAM)
+
+
+Los GAMs (del inglés generalized additive models) son una generalización de los GLMs para incorporar formas no lineales de los predictores (splines, Polinomios, o funciones Step, etc…). El proceso de suavización en GAMs se lleva a cabo a través de los suavizadores (smoothers), entre los que destacan, entre otros, los Splines penalizados P-Splines.
+
+
+Al igual que en la sección anterior, vamos a implementar estos modelos para estimar la variable IMDB_score.
+
+a) Usando únicamente la variable release_year, predecir la popularidad de cada título (usando un tipo de modelo que crea adecuado) con una curva de splines penalizados. Usar k = 1, 2, 3, 5, 10, 20, 50 nodos y comparar todas las curvas estimadas en un mismo gráfico.
+
+
+```{r fig.cap=" Comparación entre los valores observados y estimados de cada modelo", out.width="80%"}
+#make this example reproducible
+set.seed(1)
+
+nodesAmounts = c(1, 2, 3, 5, 10, 20, 50)
+pred_gam = data.frame('imdb_score' = scores.test$score)
+
+allNodesDataframe = tibble()
+
+for (nodes in nodesAmounts) {
+  mod_gam = mgcv::gam(score ~ s(releaseYear, k = nodes, sp = 0, bs = 'cr'), data = scores.train) 
+  nam = paste("mod_gam", nodes, sep = "")
+  assign(nam, mod_gam)
+  preds = predict(mod_gam, scores.test)
+  pred_gam = cbind(pred_gam, preds)
+  plot = plot + geom_line(data=tibble(releaseYear=scores.test$releaseYear,
+                                      score=preds))
+  allNodesDataframe = rbind(allNodesDataframe, tibble(releaseYear=scores.test$releaseYear,
+                                      score=preds, nodesAmount=nodes))
+  nodesResults =  data.frame('k'= nodes,'rmse'=mean((preds - scores.test$score)^2)) 
+  if (nodes == 1) {
+    rmse_gam = nodesResults
+  } else {
+    rmse_gam = rbind(rmse_gam, nodesResults)
+  }
+}
+
+ ggplot(scores.test, aes(x=releaseYear, y=score)) + geom_point() +
+   geom_line(data=allNodesDataframe, aes(x=releaseYear, y=score, colour=factor(nodesAmount)))
+
+```
+
+Se puede ver cómo las curvas con más nodos son más ruidosas en comparación a la de menor k.
+
+Comparemos las predicciones con los distintos modelos:
+
+- Cuando comparamos en la siguiente figura como varía la métrica de RMSE versus k, vemos que el valor más bajo del mismo se obtuvo para los k=1,2 y 5.
+
+```{r fig.cap=" Comparación de RMSE para los modelos en función del valor de k ", out.width="80%"}
+ggplot(rmse_gam, aes(x=k, y= rmse)) +
+  geom_point() +
+  geom_line() +
+  labs(x='k', y='RMSE', title='Gam')
+```
+
+
+Ahora podemos visualirar las estimaciones en un scatter para ver cuanto se alejan de la relación 1:1 entre los valores estimados y predichos. De esta gráfico se observa que ningún modelo parece estimar correctamente el score de las películas, dado que vemos que para distintos valores del score observado se obtiene una predicción que se encuentra entre 6 y 7 del score.
+
+```{r fig.cap=" Comparación entre los valores observados y estimados de cada modelo", out.width="80%"}
+## NOTA: no le pude incluir la legenda
+
+# Create Unique Column Names
+names(pred_gam) = make.names(names(pred_gam), unique=TRUE)
+
+ggplot(pred_gam, aes(y=imdb_score)) +                    # basic graphical object
+  geom_point(aes(x=preds), colour="red") +  # first layer
+  geom_point(aes(x=preds.1), colour="green")+  # second layer+
+  geom_point(aes(x=preds.2), colour="blue")+  # second layer+ 
+  geom_point(aes(x=preds.3), colour="pink")+  # second layer+
+  geom_point(aes(x=preds.4), colour="orange")+  # second layer+
+  geom_point(aes(x=preds.5), colour="yellow")+  # second layer+
+  geom_point(aes(x=preds.6), colour="black")+  # second layer+
+  geom_abline(intercept=0, slope=1) +
+  labs(x='Predicted Values', y='Actual Values', title='Modelos GAM diferentes valores de k')
+#+    scale_color_manual(values = c("k=1" = "black", "k=2" = "red"))
+```
+
+#### Comparación de modelos
+
+En esta sección vamos a implementar una diversidad de modelos y comparar su performance.
+
+a) Dividir al conjunto de datos en entrenamiento y testeo (tambien puede usar otra técnica, como
+validación cruzada). Con todas las variables que tiene disponibles, probar al menos 10 modelos
+diferentes y elegir el que minimice el error cuadrático médio de predicción para el rating de
+IMDB.
+
+Primero vamos a generar un nuevo dataframe con todos los features que podemos utilizar.
+
+```{r,include=FALSE}
+credit <- readr::read_csv("credits_train.csv") 
+title <- readr::read_csv("titles_train.csv") 
+
+#colSums(is.na(title)) #chek number of missing value of each columns
+#eliminar duplicados
+title = title %>% group_by(imdb_id) %>% filter(row_number() == 1)
+# elimine las columnas con muchos null
+title <- subset(title, select = -c(seasons,age_certification )) #drop "Poster Link" & "Overview" columns
+#colSums(is.na(title)) #chek number of missing value of each columns
+title <- title[-which(is.na(title$imdb_votes)),]
+
+#colSums(is.na(title)) #check if there's still any missing value
+title<- title[title$type=='MOVIE',]
+# TODO: Replace Genre with a collection of binary columns
+genreCorpus = VCorpus(VectorSource(title$genres))
+genreCorpus = tm_map(genreCorpus, content_transformer(tolower))
+genreCorpus = tm_map(genreCorpus, removeWords, c("N/A"))
+genreCorpus = tm_map(genreCorpus, removePunctuation)
+genreDocumentTermMatrix = DocumentTermMatrix(genreCorpus)
+genreMatrix = as.data.frame(as.matrix(genreDocumentTermMatrix))
+title = merge(genreMatrix, title, by=0, all=TRUE)
+```
+
+
+
+```{r}
+
+#make this example reproducible
+set.seed(1)
+movie <- merge(title, credit, by = 'id')
+#use 70% of dataset as training set and 30% as test set
+scoresSample = sample(c(TRUE, FALSE), nrow(movie), replace=TRUE, prob=c(0.7,0.3))
+Train = movie[scoresSample, ]
+Test  = movie[!scoresSample, ]
+
+
+Features_train = Train[,3:21]
+Features_train = cbind(Features_train, Train[,26:27])
+Features_train$imdb_score = Train$imdb_score
+Features_train$production_countries = Train$production_countries
+
+Features_train$name = as.factor(Train$name)
+
+Features_test = Test[,3:21] 
+Features_test = cbind(Features_test,Test[,26:27])
+Features_test$imdb_score = Test$imdb_score
+Features_test$production_countries = Test$production_countries
+Features_test$name = as.factor(Test$name)
+
+```
+
+
+Ahora vamos a seleccionar distintos modelos y compararlos para quedarnos con el que tenga el menor RMSE. Para este punto también vamos a utilizar la librería caret que nos va a permitir configurar los modelos, hacer selección de variables de una forma más simple. Los modelos que vamos a evalurar serán distintas variaciones de los modelos introducidos en las secciones anteriores.
+
+a) Modelos lineales mixtos
+
+```{r}
+lmer.all <-lmer(imdb_score ~ 1+crime+documentation+drama+european+family+history+horror+music+romance+scifi+sport+thriller+war+western+(1|release_year)+(1|runtime)+(1|name), data =Features_train) 
+summary(lmer.all)
+```
+
+
+b) Modelos lineales mixtos
+
+```{r}
+lmer.fit2= lmer(imdb_score ~1+crime+documentation+drama+romance+scifi+thriller+(runtime | production_countries), data = Features_train)
+lmer.fit2 %>% summary()
+```
+
+c) Modelos lineales mixtos
+
+```{r}
+lmer.fit3= lmer(imdb_score ~1+crime+documentation+drama+european+family+history+horror+music+romance+scifi+sport+thriller+war+western+ (1 | production_countries)+(1|name), data = Features_train)
+lmer.fit3 %>% summary()
+```
+
+d) Modelos aditivos utilizando la libreria caret
+
+Para el siguiente modelo, se eliminaron del dataset algunas variables dado por el tiempo que tardaba el modelo en realizar el ajuste de los parámetros (estas variables fueron: nombre, año y país).
+
+```{r}
+#make this example reproducible
+set.seed(1)
+gam.train<-  train(imdb_score ~ . , data=Features_train[,-c(20,23,24)],  method= 'gam',
+                family = Gamma(link = log))
+
+gam.train %>% summary()
+
+```
+
+```{r fig.cap=" RMSE selección de variables", out.width="80%"}
+trellis.par.set(caretTheme())
+plot(gam.train) 
+```
+e) Modelos aditivos utilizando la libreria caret
+
+```{r}
+
+#make this example reproducible
+set.seed(1)
+gam2.train<-  train(imdb_score ~ . , data=Features_train[,-c(19,20,23,24)],  method= 'gam',
+                family = Gamma(link = log))
+
+gam2.train %>% summary()
+
+```
+
+
+f) Elastic-Net Regularized Generalized Linear Models with caret
+
+```{r}
+
+# make this example reproducible
+set.seed(1)
+glmnet.train<-  train(imdb_score ~ . , data=Features_train[,-c(19,20,23,24)],method="glmnet",tuneLength=5,family="gaussian",
+trControl=trainControl(method="cv",number=3))
+
+glmnet.train %>% summary()
+
+```
+
+
+g) Elastic-Net Regularized Generalized Linear Models with caret
+
+```{r}
+
+# make this example reproducible
+set.seed(1)
+glmnet2.train<-  train(imdb_score ~ . , data=Features_train[,-c(20,23,24)],method="glmnet",tuneLength=5,family="gaussian",
+trControl=trainControl(method="cv",number=3))
+
+glmnet2.train %>% summary()
+
+```
+
+h) Modelo GLM bayesiano utilizando la libreria caret
+
+```{r}
+ #make this example reproducible
+set.seed(1)
+
+bayesglm.train = train(imdb_score ~ . , data=Features_train[,-c(20,23,24)],  method= 'bayesglm' ,
+                family = Gamma(link = log))
+
+bayesglm.train %>% summary()
+```
+
+g) Modelos lineales mixtos en carte utilizando selección de variables. En este apartado, vamos a comparar distintos modelos basados en la selección de variables y quedarnos con la que tiene mejor performace.
+
+```{r, include=FALSE}
+#make this example reproducible
+set.seed(1)
+
+glm.train<-  train(imdb_score ~ . , data=Features_train[,-c(20,23,24)],   method = 'glmStepAIC',
+                family = Gamma(link = log))
+
+glm.train %>% summary()
+```
+
+
+Resultados generales
+
+```{r}
+summary(glm.train)
+```
+
+
+```{r echo=FALSE}
+#install.packages("readxl")
+#library(readxl)
+```
+
+```{r}
+lmer_pred <- predict(lmer.all, Features_test, allow.new.levels=T)
+resultados<- data.frame('lmer v1'= postResample(pred = lmer_pred, obs = Features_test$imdb_score))
+
+lmer_pred2 <- predict(lmer.fit2, Features_test, allow.new.levels=T)
+resultados<- cbind(resultados,'lmer v2'=postResample(pred = lmer_pred2, obs = Features_test$imdb_score))
+
+lmer_pred3 <- predict(lmer.fit3, Features_test, allow.new.levels=T)
+resultados<- cbind(resultados,'lmer v3'=postResample(pred = lmer_pred3, obs = Features_test$imdb_score))
+
+glmnet_pred <- predict(glmnet.train, Features_test[,-c(20,23,24)])
+resultados<- cbind(resultados,'glmnet'=postResample(pred = glmnet_pred, obs = Features_test$imdb_score))
+
+glmnet2_pred <- predict(glmnet2.train, Features_test[,-c(20,23,24)])
+resultados<- cbind(resultados,'glmnet2'=postResample(pred = glmnet2_pred, obs = Features_test$imdb_score))
+
+gam_pred <- predict(gam.train, Features_test[,-c(20,23,24)])
+resultados<- cbind(resultados,'gam'=postResample(pred = gam_pred, obs = Features_test$imdb_score))
+
+bh_pred <- predict(bayesglm.train, Features_test[,-c(20,23,24)])
+resultados<- cbind(resultados,'bayes'=postResample(pred = bh_pred, obs = Features_test$imdb_score))
+
+gml_pred <- predict(glm.train, Features_test[,-c(20,23,24)])
+resultados<- cbind(resultados,'gml'=postResample(pred = gml_pred, obs = Features_test$imdb_score))
+
+
+Features_test$lmer_pred<-lmer_pred
+Features_test$lmer_pred2<-lmer_pred2
+Features_test$lmer_pred3<-lmer_pred3
+Features_test$glmnet_pred<-glmnet_pred
+Features_test$glmnet2_pred<-glmnet2_pred
+Features_test$gam_pred<-gam_pred
+Features_test$gml_pred<-gml_pred
+Features_test$bh_pred<-bh_pred
+resultados
+
+```
+
+```{r}
+fit_0_plot<- ggplot(Features_test, aes(x=lmer_pred, y= imdb_score)) +
+  geom_point() +
+  geom_abline(intercept=0, slope=1) +
+  labs(x='Predicted Values', y='Actual Values', title='lmer v1')
+
+fit_1_plot<- ggplot(Features_test, aes(x=lmer_pred2, y= imdb_score)) +
+  geom_point() +
+  geom_abline(intercept=0, slope=1) +
+  labs(x='Predicted Values', y='Actual Values', title='lmer v2')
+
+fit_3_plot<- ggplot(Features_test, aes(x=lmer_pred3, y= imdb_score)) +
+  geom_point() +
+  geom_abline(intercept=0, slope=1) +
+  labs(x='Predicted Values', y='Actual Values', title='lmer v3')
+
+fit_4_plot<- ggplot(Features_test, aes(x=gam_pred, y= imdb_score)) +
+  geom_point() +
+  geom_abline(intercept=0, slope=1) +
+  labs(x='Predicted Values', y='Actual Values', title='GAM')
+
+fit_5_plot<- ggplot(Features_test, aes(x=gml_pred, y= imdb_score)) +
+  geom_point() +
+  geom_abline(intercept=0, slope=1) +
+  labs(x='Predicted Values', y='Actual Values', title='GLM')
+
+fit_6_plot<- ggplot(Features_test, aes(x=bh_pred, y= imdb_score)) +
+  geom_point() +
+  geom_abline(intercept=0, slope=1) +
+  labs(x='Predicted Values', y='Actual Values', title='Bayes')
+
+fit_7_plot<- ggplot(Features_test, aes(x=bh_pred, y= imdb_score)) +
+  geom_point() +
+  geom_abline(intercept=0, slope=1) +
+  labs(x='Predicted Values', y='Actual Values', title='GLMNET')
+
+fit_8_plot<- ggplot(Features_test, aes(x=glmnet2_pred, y= imdb_score)) +
+  geom_point() +
+  geom_abline(intercept=0, slope=1) +
+  labs(x='Predicted Values', y='Actual Values', title='GLMNET V2')
+
+plot_grid(fit_0_plot,fit_1_plot,fit_2_plot, fit_3_plot, fit_4_plot, fit_5_plot, fit_6_plot,
+          fit_7_plot, fit_8_plot,labels = "AUTO")
+```
+
+### Predicciones utilizando el mejor modelo obtenido anteriormente
+
+Entre estos, el mejor modelo parece ser lmer.v1, que es un modelo lineal mixto, y es con el que realizaremos las predicciones del punto 6.
+
+Primero vamos a realizar los mismos pasos de ingenieria de features que el dataset de training, y luego realizar las predicciones.
+
+```{r include=FALSE}
+credit_test <- readr::read_csv("credits_test.csv") 
+titles_test <- readr::read_csv("titles_test.csv")
+titles_test<- titles_test[titles_test$type=='MOVIE',]
+merged_test = merge(titles_test, credit_test, by = 'id')
+```
+
+```{r include=FALSE}
+genreCorpus_mt = VCorpus(VectorSource(merged_test$genres))
+genreCorpus_mt= tm_map(genreCorpus_mt, content_transformer(tolower))
+genreCorpus_mt = tm_map(genreCorpus_mt, removeWords, c("N/A"))
+genreCorpus_mt = tm_map(genreCorpus_mt, removePunctuation)
+genreDocumentTermMatrix_mt = DocumentTermMatrix(genreCorpus_mt)
+genreMatrix_mt = as.data.frame(as.matrix(genreDocumentTermMatrix_mt))
+merged_test = merge(genreMatrix_mt, merged_test, by=0, all=TRUE)
+
+merged_test$name = as.factor(merged_test$name)
+```
+
+```{r}
+lmer_pred_test <- predict(lmer.all, merged_test, allow.new.levels=T)
+merged_test$pred<- lmer_pred_test
+```
+
+Si bien no contamos con los valores reales de los score, vamos a realizar un breve análisis visual relacionando las predicciones con los features. De los gráficos podemos ver que el rango dinámico de las estimaciones del test es similar a las predicciones del dataset de entrenamiento. Además, se observa que presentan una patrón similar de asociación con las variables runtime y release year.
+
+
+```{r fig.cap=" Distribución de las predicciones de IMDB_SCORE  para las películas", out.width="50%", fig.align="center", fig.width=5, fig.height=3, echo=FALSE}
+
+test_1<- ggplot(merged_test, aes(x=pred)) +
+  geom_histogram()+
+  theme_bw()+
+  labs(x = "Imdb rating", y= "Count", title = "Distribution of Imdb rating by movie")
+
+train_1<- ggplot(Features_test, aes(x=lmer_pred)) +
+  geom_histogram()+
+  theme_bw()+
+  labs(x = "Imdb rating", y= "Count", title = "Distribution of Imdb rating by movie")
+
+
+plot_grid(test_1,train_1,labels = "AUTO")
+```
+
+
+
+```{r fig.cap=" Relación entre  las predicciones de IMDB_SCORE y el año de estreno para las películas", out.width="50%", fig.align="center",out.width="80%"}
+test_1<- ggplot(merged_test, aes(x=pred,y =release_year )) +
+  geom_point()+
+  theme_bw()+
+  labs(x = "Imdb rating", y= "Count", title = "Distribution of Imdb rating by movie")
+
+train_1<- ggplot(Features_test, aes(x=lmer_pred,y =release_year)) +
+  geom_point()+
+  theme_bw()+
+  labs(x = "Imdb rating", y= "Count", title = "Distribution of Imdb rating by movie")
+
+
+plot_grid(test_1,train_1,labels = "AUTO")
+```
+
+
+```{r fig.cap=" Relación entre  las predicciones de IMDB_SCORE y el runtime para las películas", out.width="50%", fig.align="center", out.width="80%"}
+
+test_1<- ggplot(merged_test, aes(x=pred,y =runtime )) +
+  geom_point()+
+  theme_bw()+
+  labs(x = "Imdb rating", y= "Count", title = "Distribution of Imdb rating by movie")
+
+train_1<- ggplot(Features_test, aes(x=lmer_pred,y =runtime)) +
+  geom_point()+
+  theme_bw()+
+  labs(x = "Imdb rating", y= "Count", title = "Distribution of Imdb rating by movie")
+
+
+plot_grid(test_1,train_1,labels = "AUTO")
+```
